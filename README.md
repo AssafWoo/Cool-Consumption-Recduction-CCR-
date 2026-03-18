@@ -11,6 +11,7 @@
 - [Commands](#commands)
 - [Handlers](#handlers)
 - [Pipeline (Unknown Commands)](#pipeline-unknown-commands)
+- [Session Intelligence](#session-intelligence)
 - [Configuration](#configuration)
 - [Analytics](#analytics)
 - [Tee: Raw Output Recovery](#tee-raw-output-recovery)
@@ -31,16 +32,21 @@ Claude issues: git status
     ↓ Claude reads: compact changed-file list (80% fewer tokens)
 
 Claude issues: some-unknown-tool
-    ↓ PreToolUse: no handler → passes through unchanged
+    ↓ PreToolUse: no handler match (exact → alias table → BERT similarity)
     ↓ PostToolUse hook (ccr hook)
-      BERT semantic compression (~40% savings on anything)
-    ↓ Claude reads: compressed output
+      query-biased BERT compression (~40% savings on anything)
+      + session dedup: "[same output as turn N (3m ago) — 1.2k tokens saved]"
+    ↓ Claude reads: compressed, deduplicated output
 ```
 
 **CCR's edge over rule-based proxies:**
 
-- **BERT semantic compression** — unknown commands get ~40% savings instead of 0%
-- **Docker semantic dedup** — "connection refused to 10.0.0.1" and "…10.0.0.2" collapse to one line; exact-match tools keep both
+- **31 handlers (40+ aliases)** — covers the full surface area of common dev tools
+- **BERT semantic routing** — unknown commands fuzzy-matched to nearest handler via sentence embeddings
+- **Query-biased BERT** — anomaly scoring blended with command-string relevance for smarter summarization
+- **Session output cache** — identical tool outputs across turns replaced with a single reference line
+- **Session-aware compression** — budget tightens as context fills; sentence-level cross-turn dedup via ccr-sdk
+- **Log anomaly scoring** — docker/kubectl/journalctl use centroid-distance BERT scoring instead of exact-match dedup
 - **Smart `cat`** — files >500 lines use BERT importance scoring, not head+tail
 - **Conversation compression** (ccr-sdk) — 10–20% savings per turn that compound across a long session
 
@@ -147,24 +153,70 @@ Execute raw (no filtering), record analytics as a baseline. Writes a `_proxy.log
 
 ## Handlers
 
-9 handlers registered in `ccr/src/handlers/`. Each implements:
+31 handlers (40+ command aliases) in `ccr/src/handlers/`. Handler lookup is a 3-level cascade:
+
+1. **Exact match** — direct command name lookup
+2. **Static alias table** — versioned binaries (`python3.11`→`python`), wrappers (`./gradlew`→`gradle`), common aliases (`bun`→`jest`, `az`→`aws`, etc.)
+3. **BERT similarity** — unknown commands embedded and compared to 15 handler representative sentences; threshold 0.55
+
+Each handler implements:
 
 ```rust
 fn rewrite_args(&self, args: &[String]) -> Vec<String>  // inject flags before execution
 fn filter(&self, output: &str, args: &[String]) -> String
 ```
 
-| Handler | Savings | Key behavior |
-|---------|---------|-------------|
-| **cargo** | ~87% | `build`/`check`/`clippy`: injects `--message-format json`, keeps only errors + warning count. `test`: parses failure names + detail section + summary line. |
-| **git** | ~80% | Per-subcommand: `status` drops help text, caps at 20 files. `log` injects `--oneline`, caps 20. `diff` keeps only `+`/`-`/`@@`/header lines. `push`/`pull` drops progress noise. |
-| **curl** | ~96% | JSON responses: replaces values with type names (`"string"`, `"number"`, etc.); arrays show first-element schema + `[N items total]`. Size guard: passes through if schema > original. |
-| **docker** | ~85% | `logs`: `--tail 200` + **BERT semantic dedup** (cosine > 0.90 threshold). Hard-keeps errors/panics/stack traces. Falls back to exact-match dedup. `ps`/`images`: compact table. |
-| **npm/pnpm/yarn** | ~85% | `install`: `[install complete — N packages]`. `test`: failures + summary line only. `run`: errors + last 5 lines + line count. |
-| **ls** | ~80% | Dirs first, alphabetical, limit 40, `[N dirs, M files]` summary. |
-| **cat** | ~70% | ≤100 lines: pass through. 101–500: head 60 + tail 20. >500: BERT semantic summarization (budget: 80 lines). |
-| **grep / rg** | ~80% | Groups matches by file, truncates lines to 120 chars, caps at 50 matches. |
-| **find** | ~78% | Strips common prefix, groups by directory, shows 5 files/dir, caps at 50 entries. |
+**TypeScript / JavaScript**
+
+| Handler | Keys | Savings | Key behavior |
+|---------|------|---------|-------------|
+| **tsc** | `tsc` | ~90% | Groups `error TS\d+` lines by file. `Build OK` on clean. |
+| **vitest** | `vitest` | ~88% | FAIL blocks + summary; drops `✓` passing lines. |
+| **jest** | `jest`, `bun`, `deno`, `nx` | ~88% | `●` failure blocks + summary; drops `PASS` lines. |
+| **eslint** | `eslint` | ~85% | Errors grouped by file, caps at 20 + `[+N more]`. |
+
+**Python**
+
+| Handler | Keys | Savings | Key behavior |
+|---------|------|---------|-------------|
+| **pytest** | `pytest`, `py.test` | ~87% | FAILED node IDs + AssertionError block + short summary. |
+| **pip** | `pip`, `pip3`, `uv`, `poetry`, `pdm`, `conda` | ~80% | `install`: `[complete — N packages]`. `uv`: parses resolved/installed counts. |
+| **python** | `python`, `python3`, `python3.X` | ~60% | Traceback: keep block + final error. Long output: BERT summarize. |
+
+**DevOps / Cloud**
+
+| Handler | Keys | Savings | Key behavior |
+|---------|------|---------|-------------|
+| **kubectl** | `kubectl`, `k`, `minikube`, `kind` | ~85% | `get`: compact table (NAME/READY/STATUS/AGE). `logs`: BERT anomaly scoring. `describe`: key sections only. |
+| **gh** | `gh` | ~90% | `pr list`/`issue list`: compact tables. `pr checks`: `✓ N passed, ✗ M failed`. `run view`: failed steps only. |
+| **terraform** | `terraform`, `tofu` | ~88% | `plan`: `+`/`-`/`~` lines + summary. `apply`: resource lines + completion. `init`/`validate`: errors or success. |
+| **aws** | `aws`, `gcloud`, `az` | ~85% | JSON → schema (allowlisted subcommands only). `s3 ls`: grouped by prefix. |
+| **make** | `make`, `gmake`, `ninja` | ~75% | Drops directory noise. Keeps compiler errors + recipe failures. |
+| **go** | `go` | ~82% | `build`/`vet`: errors only. `test`: FAIL blocks. `run`: traceback or BERT. |
+| **mvn** | `mvn`, `mvnw`, `./mvnw` | ~80% | Drops `[INFO]` noise; keeps errors, warnings, reactor summary. |
+| **gradle** | `gradle`, `gradlew`, `./gradlew` | ~80% | Keeps FAILED tasks, Kotlin errors, failure blocks. |
+| **helm** | `helm`, `helm3` | ~85% | `list`: compact table. `status`/`diff`/`template`: structured output. |
+
+**System / Utility**
+
+| Handler | Keys | Savings | Key behavior |
+|---------|------|---------|-------------|
+| **cargo** | `cargo` | ~87% | `build`/`check`/`clippy`: injects `--message-format json`, keeps errors + warning count. `test`: failure names + detail + summary. |
+| **git** | `git` | ~80% | `status` caps 20 files. `log` injects `--oneline`, caps 20. `diff` keeps `+`/`-`/`@@` only. |
+| **curl** | `curl` | ~96% | JSON → type schema. Arrays: first-element schema + `[N items total]`. |
+| **docker** | `docker`, `docker-compose` | ~85% | `logs`: BERT anomaly scoring (centroid distance). `ps`/`images`: compact table. |
+| **npm/pnpm/yarn** | `npm`, `pnpm`, `yarn` | ~85% | `install`: package count. `test`: failures + summary. |
+| **journalctl** | `journalctl` | ~80% | Injects `--no-pager -n 200`. BERT anomaly scoring. |
+| **psql** | `psql`, `pgcli` | ~88% | Strips table borders, caps at 20 rows + `[+N more]`. |
+| **brew** | `brew` | ~75% | `install`/`update`: status lines + Caveats. `list`/`info`: compact. |
+| **tree** | `tree` | ~70% | ≤30 lines pass through. >30: first 25 + `[... N more]` + summary. |
+| **diff** | `diff` | ~75% | Keeps `+`/`-`/`@@`/header lines only (same as git diff). |
+| **jq** | `jq` | ~80% | ≤20 lines pass through. Array: schema of first element + `[N items]`. |
+| **env** | `env`, `printenv` | ~70% | Masks secrets (`KEY`, `TOKEN`, `PASSWORD`, …). Sorted, capped at 40. |
+| **ls** | `ls` | ~80% | Dirs first, alphabetical, limit 40, `[N dirs, M files]` summary. |
+| **cat** | `cat` | ~70% | ≤100 lines: pass through. 101–500: head/tail. >500: BERT importance scoring. |
+| **grep / rg** | `grep`, `rg` | ~80% | Groups by file, truncates to 120 chars, caps at 50 matches. |
+| **find** | `find` | ~78% | Strips common prefix, groups by directory, 5 files/dir, caps at 50. |
 
 ---
 
@@ -178,6 +230,46 @@ Any command without a handler goes through four stages:
 4. **BERT semantic summarization** — triggered when line count > `summarize_threshold_lines` (default 200)
 
 **BERT scoring:** Each line is scored as `1 - cosine_similarity(embedding, centroid)`. High score = outlier = informative. Lines matching error/warning patterns are hard-kept regardless of score. Falls back to head+tail if the model is unavailable.
+
+---
+
+## Session Intelligence
+
+CCR tracks state across tool-use turns within a Claude Code session. The session is identified by `CCR_SESSION_ID=$PPID` (Claude Code's PID, injected by the hook script) — stable across all hook invocations in one session. State is persisted at `~/.local/share/ccr/sessions/<id>.json`.
+
+### B3: Cross-turn output cache
+
+When `ccr run` produces output it embeds it (384-dim BERT) and checks against recent entries with cosine similarity > 0.92. On a hit, the output is replaced with:
+
+```
+[same output as turn 4 (3m ago) — 1.2k tokens saved]
+```
+
+On a miss, the embedding and a 600-char content preview are recorded (ring buffer, max 30 entries).
+
+### B2: Query-biased BERT summarization
+
+The PostToolUse hook passes the command string as a query to the summarizer. Scoring becomes:
+
+```
+score = 0.5 × anomaly_score + 0.5 × cosine_similarity(line, query_embedding)
+```
+
+This surfaces lines that are both informative (outliers) and relevant to what Claude asked for.
+
+### C1: Sentence-level cross-turn deduplication
+
+Before emitting output, the hook runs ccr-sdk's sentence deduplicator against the 8 most recent session entries. Sentences that repeat earlier content are replaced with `[covered in turn N]`.
+
+### C2: Session-aware compression budget
+
+As cumulative session tokens grow, `ccr hook` tightens the line budget passed to the BERT summarizer:
+
+| Session tokens | Compression factor | Effect |
+|---------------|-------------------|--------|
+| < 50k | 1.0 | No extra compression |
+| 50k–100k | 1.0 → 0.5 | Budget scales linearly |
+| > 100k | 0.5 | Max compression (50% of lines) |
 
 ---
 
@@ -300,7 +392,16 @@ Multiple PreToolUse hooks run in order — CCR merges into the existing array, p
 
 ### PostToolUse
 
-`ccr hook` receives output JSON after any Bash call. Extracts `tool_response.output`, runs the BERT pipeline, returns `{ "output": "<filtered>" }`. Never fails — returns nothing on any error so Claude Code always sees a result.
+`ccr hook` receives output JSON after any Bash call. Pipeline:
+
+1. Extract `tool_response.output` (or error)
+2. Run 4-stage BERT pipeline with command string as query (B2 biasing)
+3. Apply sentence-level cross-turn dedup via ccr-sdk (C1)
+4. If session is token-heavy, apply extra BERT compression (C2)
+5. Embed output, record to session cache (B3)
+6. Return `{ "output": "<filtered>" }`
+
+Never fails — returns nothing on any error so Claude Code always sees a result.
 
 ### Hook JSON contract
 
@@ -325,13 +426,18 @@ Multiple PreToolUse hooks run in order — CCR merges into the existing array, p
 
 | Feature | CCR | RTK |
 |---------|-----|-----|
-| Unknown commands | BERT fallback (~40%) | Pass through (0%) |
-| Docker log dedup | BERT semantic (cosine > 0.90) | Exact-match only |
+| Handler count | **31 (40+ aliases)** | 40+ |
+| Unknown commands | BERT routing + fallback (~40%) | Pass through (0%) |
+| Handler routing | Exact → alias table → BERT similarity | Exact match only |
+| Log handlers (docker/kubectl/journal) | BERT anomaly scoring (centroid distance) | Exact-match dedup |
 | `cat` large files | BERT importance scoring | head+tail |
-| Conversation history | ccr-sdk: tiered + Ollama + dedup | — |
+| Cross-turn output cache | Yes (cosine > 0.92, turn reference) | — |
+| Query-biased summarization | Yes (anomaly + command relevance blend) | — |
+| Session-aware compression | Yes (scales to 50% at 100k tokens) | — |
+| Sentence-level cross-turn dedup | Yes (ccr-sdk, marks `[covered in turn N]`) | — |
+| Conversation history compression | ccr-sdk: tiered + Ollama + dedup | — |
 | Evaluation suite | ccr-eval (Q&A + conv fixtures) | — |
-| Handler count | 9 | 40+ |
-| Hooks preserved on init | Yes (merges) | Overwrites |
+| Hooks preserved on init | Yes (merges arrays) | Overwrites |
 
 ---
 
@@ -340,13 +446,23 @@ Multiple PreToolUse hooks run in order — CCR merges into the existing array, p
 ```
 ccr/                     CLI binary
   src/main.rs            Commands enum, init() with merge_hook()
-  src/hook.rs            PostToolUse (JSON in → JSON out)
-  src/cmd/               filter, run, proxy, rewrite, gain, discover
-  src/handlers/          cargo, git, curl, docker, npm, ls, read, grep, find
+  src/hook.rs            PostToolUse: B2 query-biased BERT, C1 sentence dedup,
+                         C2 session budget, B3 cache record (JSON in → JSON out)
+  src/session.rs         Per-session state: output cache, compression budget,
+                         cross-turn dedup context (CCR_SESSION_ID=$PPID)
+  src/cmd/               filter, run (B3 cache check), proxy, rewrite, gain, discover
+  src/handlers/          31 handlers: cargo, git, curl, docker, npm, ls, read,
+                         grep, find, tsc, vitest, jest, eslint, pytest, pip,
+                         python, kubectl, gh, terraform, aws, make, go, maven,
+                         brew, helm, journalctl, psql, tree, diff, jq, env
+                         + util.rs (compact_table, test_failures, is_hard_keep,
+                                    json_to_schema, cosine_similarity)
 
 ccr-core/                Core library (no I/O)
   src/pipeline.rs        ANSI strip → normalize → patterns → BERT summarize
-  src/summarizer.rs      fastembed AllMiniLML6V2, line + sentence level
+                         (process() accepts optional query for B2 biasing)
+  src/summarizer.rs      fastembed AllMiniLML6V2, OnceCell model cache (A1),
+                         anomaly scoring, summarize_with_query() for B2
   src/analytics.rs       Analytics struct (command, subcommand, duration_ms)
   src/config.rs          CcrConfig, GlobalConfig, TeeConfig, FilterAction
   src/tokens.rs          tiktoken cl100k_base
