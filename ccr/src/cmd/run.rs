@@ -305,19 +305,5 @@ fn write_tee(cmd: &str, content: &str) -> Option<PathBuf> {
 }
 
 fn append_analytics(analytics: &ccr_core::analytics::Analytics) {
-    if let Some(data_dir) = dirs::data_local_dir() {
-        let ccr_dir = data_dir.join("ccr");
-        let _ = std::fs::create_dir_all(&ccr_dir);
-        let path = ccr_dir.join("analytics.jsonl");
-        if let Ok(json) = serde_json::to_string(analytics) {
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .and_then(|mut f| {
-                    use std::io::Write;
-                    writeln!(f, "{}", json)
-                });
-        }
-    }
+    crate::util::append_analytics(analytics);
 }

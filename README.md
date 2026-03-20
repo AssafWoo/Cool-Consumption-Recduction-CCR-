@@ -1,6 +1,6 @@
 # CCR — Cool Cost Reduction
 
-> **60–95% token savings on Claude Code tool outputs.** CCR intercepts shell commands before Claude reads their output, routes them through specialized handlers, and returns compact summaries.
+> **60–95% token savings on Claude Code tool outputs.** CCR intercepts shell commands and file reads before Claude reads their output, routes them through specialized handlers, and returns compact summaries. Session intelligence tracks context pressure, deduplicates repeated outputs, and learns your project's noise patterns over time.
 
 ---
 
@@ -15,6 +15,7 @@
 - [Session Intelligence](#session-intelligence)
 - [Configuration](#configuration)
 - [Analytics](#analytics)
+- [Noise Learning](#noise-learning)
 - [Tee: Raw Output Recovery](#tee-raw-output-recovery)
 - [CCR-SDK: Conversation Compression](#ccr-sdk-conversation-compression)
 - [Hook Architecture](#hook-architecture)
@@ -29,13 +30,23 @@
 Claude issues: git status
     ↓ PreToolUse hook (ccr-rewrite.sh)
       git is a known handler → patches command to: ccr run git status
-    ↓ ccr run executes git status, filters output, writes tee file
+    ↓ ccr run checks pre-run cache (HEAD+staged+unstaged hash) [PC]
+      cache hit → "[PC: cached from 2m ago — ~1.8k tokens saved]" (skips execution)
+      cache miss → executes git status, applies noise pre-filter [NL], filters output
     ↓ Claude reads: compact changed-file list (80% fewer tokens)
 
+Claude issues: Read file.rs
+    ↓ PostToolUse hook: process_read()
+      file < 50 lines → pass through unchanged
+      file ≥ 50 lines → BERT pipeline using file extension as hint,
+                         last assistant message as query [IX],
+                         session dedup by file path
+    ↓ Claude reads: compressed file content
+
 Claude issues: some-unknown-tool
-    ↓ PreToolUse: no handler match (exact → alias table → BERT similarity)
-    ↓ PostToolUse hook (ccr hook)
-      query-biased BERT compression (~40% savings on anything)
+    ↓ PostToolUse hook: process_bash()
+      noise pre-filter removes promoted project patterns [NL]
+      intent-aware BERT compression using last assistant message [IX]
       + session dedup: "[same output as turn N (3m ago) — 1.2k tokens saved]"
     ↓ Claude reads: compressed, deduplicated output
 ```
@@ -44,7 +55,7 @@ Claude issues: some-unknown-tool
 
 - **31 handlers (40+ aliases)** — covers the full surface area of common dev tools
 - **BERT semantic routing** — unknown commands fuzzy-matched to nearest handler via sentence embeddings
-- **Intent-aware query** — PostToolUse blends command string (30%) + last assistant message (70%) so output relevant to Claude's current task scores highest
+- **Intent extraction (IX)** — PostToolUse reads Claude's last assistant message from the live JSONL session file and uses it (70%) + command string (30%) as the BERT query, so output relevant to Claude's current task scores highest
 - **Semantic line clustering** — near-duplicate lines collapse to one representative + `[N similar]` instead of repeating them N times
 - **Entropy-adjusted budget** — uniform/repetitive output (npm install, progress bars) gets a tight budget automatically; diverse output gets the full budget
 - **Contextual anchoring** — error lines keep their nearest semantic neighbors (function signatures, file pointers) for immediate context
@@ -55,6 +66,9 @@ Claude issues: some-unknown-tool
 - **Elastic Context (EC)** — pipeline tightens dynamically as the session fills: pressure ramps 0→1 between 25k–80k cumulative output tokens, shrinking BERT threshold and head/tail budget; critical pressure (>80%) appends a warning and suggests `ccr gain`
 - **Zoom-In (ZI)** — collapsed/omitted markers embed `ZI_N` IDs; run `ccr expand ZI_1` to retrieve the original lines without re-running the command
 - **Session-aware compression** — sentence-level cross-turn dedup via ccr-sdk
+- **Read/Glob hook (RH)** — PostToolUse intercepts `Read` and `Glob` tool calls in addition to Bash; file reads ≥50 lines go through BERT pipeline; glob listings >20 files are grouped by directory and session-deduped
+- **Noise learning (NL)** — per-project file tracks which output lines are consistently suppressed; lines promoted after ≥10 observations at ≥90% suppression rate become pre-filters applied before BERT; use `ccr noise` to inspect or reset
+- **Pre-run cache (PC)** — git commands with identical HEAD+staged+unstaged state return cached output instantly, skipping execution entirely; TTL 1 hour
 - **Conversation compression** (ccr-sdk) — 10–20% savings per turn that compound across a long session
 
 ---
@@ -131,7 +145,7 @@ CCR Token Savings
 ═════════════════════════════════════════════════
   Runs:           142
   Tokens saved:   182.2k  (77.7%)
-  Cost saved:     ~$0.547  (at $3.00/1M input tokens)
+  Cost saved:     ~$0.547  (at $3.00/1M — Sonnet 4.6 default — set ANTHROPIC_MODEL or cost_per_million_tokens in ccr.toml to adjust)
   Today:          23 runs · 31.4k saved · 74.3%
 
 Per-Command Breakdown
@@ -142,7 +156,10 @@ cargo            45       89.2k     87.2%      420  █████████�
 git              31       41.1k     79.1%       82  ████████████████
 curl             12       31.2k     94.3%      210  ██████████████████
 (pipeline)       18       12.4k     42.1%        —  ████████
+(read)            8        4.1k     61.3%        —  ████
 ```
+
+Pricing resolution order: `cost_per_million_tokens` in `ccr.toml` → `ANTHROPIC_MODEL` env var (Opus 4.6: $15, Sonnet 4.6: $3, Haiku 4.5: $0.80) → $3.00 default.
 
 ### Find missed opportunities
 
@@ -264,6 +281,27 @@ ccr expand --list     # list all available IDs in this session
 ```
 
 Blocks are stored per-session at `~/.local/share/ccr/expand/<session_id>/ZI_N.txt`.
+
+### ccr noise
+
+```
+ccr noise [--reset]
+```
+
+Inspect or reset the learned noise patterns for the current project:
+
+```
+Learned noise patterns  (project key: a1b2c3d4e5f60718)
+─────────────────────────────────────────────────────────────────────────────
+COUNT  SUPPR  RATE   STATUS    PATTERN
+  24     22   91%   promoted  downloading [progress]
+  18     16   88%   learning  warning: unused import
+  12     11   91%   promoted  compiling package v
+```
+
+Each line shows how many times it was seen, how often CCR suppressed it, and whether it has been promoted to a permanent pre-filter. Critical lines (errors, warnings, panics) are never promoted.
+
+`--reset` clears all patterns for the current project.
 
 ### ccr proxy
 
@@ -408,6 +446,22 @@ As cumulative session tokens grow, `ccr hook` tightens the full pipeline — not
 
 On top of EC, `ccr hook` applies a second-pass budget to the already-compressed output when the session is token-heavy (compression_factor < 0.90). Historical per-command centroid is used for this pass when available.
 
+### PC: Pre-run structural cache
+
+Before executing a git command, `ccr run` computes a cache key from the current HEAD hash + staged content hash + unstaged content hash. If an entry with that exact key exists (TTL: 1 hour), execution is skipped entirely:
+
+```
+[PC: cached from 4m ago — ~1.8k tokens saved; key a1b2c3d4]
+```
+
+Supported subcommands: `status`, `diff`, `log`, `branch`, `stash`. Cache is per-session so independent sessions don't share potentially stale state.
+
+### IX: Intent-aware BERT query
+
+The PostToolUse hook reads the most recently modified `.jsonl` file in `~/.claude/projects/<project-dir>/`, scans the last 16 KB for the latest assistant message, and passes a cleaned version as the BERT query (truncated at the first sentence, max 256 chars). This means lines relevant to what Claude is currently trying to do rank higher than generic anomaly scoring would produce.
+
+Falls back to the command string if no session file is found or parsing fails.
+
 ---
 
 ## Configuration
@@ -422,6 +476,7 @@ tail_lines = 30
 strip_ansi = true
 normalize_whitespace = true
 deduplicate_lines = true
+# cost_per_million_tokens = 15.0  # override pricing for ccr gain (default: model-aware)
 
 [tee]
 enabled = true
@@ -447,9 +502,23 @@ To add a custom handler, implement the `Handler` trait and register it in `get_h
 
 ---
 
+## Noise Learning
+
+CCR automatically learns which output lines are noise in your project. After each run, it records which lines were present in the raw output but absent in the compressed output. When a normalized line has been seen ≥10 times with a suppression rate ≥90%, it is **promoted** to a permanent pre-filter — applied before BERT so the pipeline doesn't even score it.
+
+Patterns are stored per-project at `~/.local/share/ccr/projects/<project-key>/noise.json`. They are project-specific so a "downloading" line in one repo doesn't affect another.
+
+**Safeguards:**
+- Lines matching `error`, `warning`, `failed`, `fatal`, `panic`, `exception` are never promoted
+- Progress-bar characters (`█`, `▓`, `░`, `=`, `-`) are normalized to `[progress]` before matching
+- Stale patterns (not seen in 30 days) are evicted automatically
+- Pattern count capped at 10,000 entries per project
+
+---
+
 ## Analytics
 
-Every CCR operation appends a record to `~/.local/share/ccr/analytics.jsonl`:
+Every CCR operation (both `ccr run` and PostToolUse hook) appends a record to `~/.local/share/ccr/analytics.jsonl`:
 
 ```json
 {
@@ -529,17 +598,30 @@ Multiple PreToolUse hooks run in order — CCR merges into the existing array, p
 
 ### PostToolUse
 
-`ccr hook` receives output JSON after any Bash call. Pipeline:
+`ccr hook` receives output JSON after any Bash, Read, or Glob call. Dispatches by `tool_name`:
+
+**Bash pipeline:**
 
 1. Extract `tool_response.output` (or error)
-2. Compute session `context_pressure()` → adjust pipeline config (EC)
-3. Enable Zoom-In (ZI); run 4-stage BERT pipeline with command string as query (B2 biasing)
-4. Persist zoom blocks to `~/.local/share/ccr/expand/` (ZI)
-5. Apply delta compression against prior runs of same subcommand key (SD)
-6. Apply sentence-level cross-turn dedup via ccr-sdk (C1)
-7. If session is token-heavy, apply extra BERT compression (C2)
-8. Embed output, update per-command centroid, record to session cache (B3)
-9. Return `{ "output": "<filtered>" }`
+2. Apply project noise pre-filter — remove promoted patterns (NL)
+3. Compute session `context_pressure()` → adjust pipeline config (EC)
+4. Extract last assistant message from session JSONL as BERT query (IX)
+5. Enable Zoom-In (ZI); run 4-stage BERT pipeline with intent query (B2 biasing)
+6. Persist zoom blocks to `~/.local/share/ccr/expand/` (ZI)
+7. Record suppressed lines to noise learner (NL)
+8. Apply delta compression against prior runs of same subcommand key (SD)
+9. Apply sentence-level cross-turn dedup via ccr-sdk (C1)
+10. If session is token-heavy, apply extra BERT compression (C2)
+11. Embed output, update per-command centroid, record to session cache (B3)
+12. Record to `analytics.jsonl`; return `{ "output": "<filtered>" }`
+
+**Read pipeline:**
+
+Files < 50 lines pass through unchanged. For larger files: BERT pipeline with file extension as hint, intent as query; session dedup by file path (same file same content → reference line).
+
+**Glob pipeline:**
+
+Results ≤ 20 paths pass through. Larger lists: grouped by parent directory, max 60 shown with `[+N more in dir/]` overflow; session dedup by path-list hash.
 
 Never fails — returns nothing on any error so Claude Code always sees a result.
 
@@ -571,6 +653,11 @@ Never fails — returns nothing on any error so Claude Code always sees a result
 | Handler routing | Exact → alias table → BERT similarity | Exact match only |
 | Log handlers (docker/kubectl/journal) | BERT anomaly scoring (centroid distance) | Exact-match dedup |
 | `cat` large files | BERT importance scoring | head+tail |
+| Read tool compression | Yes (BERT pipeline for files ≥50 lines) [RH] | — |
+| Glob tool compression | Yes (dir grouping, session dedup) [RH] | — |
+| Intent-aware query | Yes (last assistant message via JSONL) [IX] | — |
+| Project noise learning | Yes (auto-promotes lines at ≥90% suppression) [NL] | — |
+| Pre-run structural cache | Yes (git commands by HEAD+staged+unstaged) [PC] | — |
 | Cross-turn output cache | Yes (cosine > 0.92, turn reference) | — |
 | Query-biased summarization | Yes (anomaly + command relevance blend) | — |
 | Session-aware compression | Yes (scales to 50% at 100k tokens) | — |
@@ -585,14 +672,19 @@ Never fails — returns nothing on any error so Claude Code always sees a result
 
 ```
 ccr/                     CLI binary
-  src/main.rs            Commands enum, init() with merge_hook()
-  src/hook.rs            PostToolUse: EC pressure, ZI enable, B2 query-biased BERT,
-                         SD delta, C1 sentence dedup, C2 budget, B3 cache record
+  src/main.rs            Commands enum, init() with merge_hook() (Bash+Read+Glob)
+  src/hook.rs            PostToolUse dispatch: Bash (IX+NL+EC+ZI+SD+C1+C2+B3),
+                         Read (BERT pipeline for files ≥50 lines),
+                         Glob (directory grouping + session dedup)
   src/session.rs         Per-session state: output cache, context_pressure (EC),
                          compression budget, subcommand-aware delta keys (SD),
                          state_content full storage, cross-turn dedup context
   src/zoom_store.rs      ZI block persistence: save_blocks / load_block / list_blocks
-  src/cmd/               filter, run, proxy, rewrite, gain, discover, expand (ZI)
+  src/intent.rs          IX: reads last assistant message from live JSONL session file
+  src/noise_learner.rs   NL: per-project noise pattern store with promote/evict logic
+  src/pre_cache.rs       PC: structural git cache keyed on HEAD+staged+unstaged hashes
+  src/util.rs            hash_str (FNV-1a), project_key, append_analytics
+  src/cmd/               filter, run, proxy, rewrite, gain, discover, expand, noise
   src/handlers/          31 handlers: cargo, git, curl, docker, npm, ls, read,
                          grep, find, tsc, vitest, jest, eslint, pytest, pip,
                          python, kubectl, gh, terraform, aws, make, go, maven,

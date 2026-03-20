@@ -198,6 +198,24 @@ fn process_bash(hook_input: HookInput) -> Result<()> {
         );
     }
 
+    // Record analytics so `ccr gain` reflects hook-path savings.
+    let input_tokens = ccr_core::tokens::count_tokens(&output_text);
+    let output_tokens = ccr_core::tokens::count_tokens(&final_output);
+    let subcommand = hook_input
+        .tool_input
+        .get("command")
+        .and_then(|v| v.as_str())
+        .and_then(|cmd| cmd.split_whitespace().nth(1))
+        .map(|s| s.to_string());
+    let analytics = ccr_core::analytics::Analytics::new(
+        input_tokens,
+        output_tokens,
+        command_hint,
+        subcommand,
+        None,
+    );
+    crate::util::append_analytics(&analytics);
+
     let hook_output = HookOutput { output: final_output };
     println!("{}", serde_json::to_string(&hook_output)?);
 
