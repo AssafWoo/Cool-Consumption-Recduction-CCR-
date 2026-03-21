@@ -41,7 +41,7 @@ After `ccr init`, **this is fully automatic** — no changes to how you use Clau
 
 **What makes CCR different from rule-based proxies:**
 
-- **31 handlers (40+ aliases)** — purpose-built filters for common dev tools (cargo, git, kubectl, gh, terraform, pytest, tsc, …)
+- **38 handlers (50+ aliases)** — purpose-built filters for common dev tools (cargo, git, kubectl, gh, terraform, pytest, tsc, …)
 - **BERT semantic routing** — unknown commands fuzzy-matched to nearest handler via sentence embeddings
 - **Intent-aware compression** — uses Claude's last message as the BERT query so output relevant to the current task scores highest
 - **Noise learning** — learns which lines are boilerplate in your project and pre-filters them before BERT runs
@@ -192,7 +192,7 @@ When savings exceed 60%, the raw output is saved to `~/.local/share/ccr/tee/<ts>
 
 ## Handlers
 
-31 handlers (40+ command aliases) in `ccr/src/handlers/`. Lookup cascade:
+38 handlers (50+ command aliases) in `ccr/src/handlers/`. Lookup cascade:
 
 1. **Exact match** — direct command name
 2. **Static alias table** — versioned binaries, wrappers, common aliases
@@ -206,6 +206,9 @@ When savings exceed 60%, the raw output is saved to `~/.local/share/ccr/tee/<ts>
 | **vitest** | `vitest` | ~88% | FAIL blocks + summary; drops `✓` lines. |
 | **jest** | `jest`, `bun`, `deno`, `nx` | ~88% | `●` failure blocks + summary; drops `PASS` lines. |
 | **eslint** | `eslint` | ~85% | Errors grouped by file, caps at 20 + `[+N more]`. |
+| **next** | `next` | ~90% | `build`: route table collapsed, errors + page count. `dev`: errors + ready line. `lint`: ESLint-style. |
+| **playwright** | `playwright` | ~88% | Failing test names + error messages; passing tests dropped. |
+| **prettier** | `prettier` | ~80% | `--check`: files needing formatting + count. `--write`: file count. Mode auto-inferred. |
 
 **Python**
 
@@ -225,6 +228,8 @@ When savings exceed 60%, the raw output is saved to `~/.local/share/ccr/tee/<ts>
 | **aws** | `aws`, `gcloud`, `az` | ~85% | JSON → schema. `s3 ls`: grouped by prefix. |
 | **make** | `make`, `gmake`, `ninja` | ~75% | Drops directory noise. Keeps errors + recipe failures. |
 | **go** | `go` | ~82% | `build`/`vet`: errors only. `test`: FAIL blocks. |
+| **golangci-lint** | `golangci-lint`, `golangci_lint` | ~88% | Diagnostics grouped by file; INFO/DEBUG runner noise dropped. |
+| **prisma** | `prisma` | ~85% | `generate`: client summary. `migrate`: migration names. `db push`: sync status. |
 | **mvn** | `mvn`, `mvnw`, `./mvnw` | ~80% | Drops `[INFO]` noise; keeps errors + reactor summary. |
 | **gradle** | `gradle`, `gradlew`, `./gradlew` | ~80% | FAILED tasks, Kotlin errors, failure blocks. |
 | **helm** | `helm`, `helm3` | ~85% | `list`: compact table. `status`/`diff`/`template`: structured. |
@@ -237,7 +242,9 @@ When savings exceed 60%, the raw output is saved to `~/.local/share/ccr/tee/<ts>
 | **git** | `git` | ~80% | `status` caps 20 files. `log` injects `--oneline`, caps 20. `diff`: `+`/`-`/`@@` only. |
 | **curl** | `curl` | ~96% | JSON → type schema. Arrays: first-element schema + `[N items]`. |
 | **docker** | `docker`, `docker-compose` | ~85% | `logs`: BERT anomaly. `ps`/`images`: compact table. |
-| **npm/pnpm/yarn** | `npm`, `pnpm`, `yarn` | ~85% | `install`: package count. `test`: failures + summary. |
+| **npm/yarn** | `npm`, `yarn` | ~85% | `install`: package count. `test`: failures + summary. |
+| **pnpm** | `pnpm`, `pnpx` | ~87% | `install`: `Packages:` + `Progress:` summary; drops progress bars. `run`/`exec`: errors + tail. |
+| **clippy** | `clippy`, `cargo-clippy` | ~85% | Rustc-style diagnostics filtered; span lines dropped; duplicate warnings collapsed. |
 | **journalctl** | `journalctl` | ~80% | Injects `--no-pager -n 200`. BERT anomaly scoring. |
 | **psql** | `psql`, `pgcli` | ~88% | Strips borders, caps at 20 rows + `[+N more]`. |
 | **brew** | `brew` | ~75% | `install`/`update`: status lines + Caveats. |
