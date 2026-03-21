@@ -60,10 +60,17 @@ fn process_bash(hook_input: HookInput) -> Result<()> {
         return Ok(());
     }
 
-    let command_hint = full_cmd
-        .split_whitespace()
-        .next()
-        .map(|s| s.to_string());
+    // If command was rewritten by a wrapper (e.g. RTK: "rtk git status"),
+    // attribute analytics to the real underlying command, not the wrapper.
+    let command_hint = {
+        let mut tokens = full_cmd.split_whitespace();
+        let first = tokens.next().unwrap_or("");
+        if first == "rtk" {
+            tokens.next().map(|s| s.to_string())
+        } else {
+            Some(first.to_string())
+        }
+    };
 
     let output_text = if let Some(err) = &hook_input.tool_response.error {
         err.clone()
@@ -95,7 +102,13 @@ fn process_bash(hook_input: HookInput) -> Result<()> {
     let sid = crate::session::session_id();
     let mut session = crate::session::SessionState::load(&sid);
 
-    let cmd_key: String = full_cmd
+    // cmd_key for session tracking: skip wrapper prefix so "rtk git status" → "git status"
+    let effective_cmd = if full_cmd.trim_start().starts_with("rtk ") {
+        full_cmd.trim_start().trim_start_matches("rtk ").trim_start()
+    } else {
+        full_cmd.trim_start()
+    };
+    let cmd_key: String = effective_cmd
         .split_whitespace()
         .take(2)
         .collect::<Vec<_>>()
@@ -221,7 +234,7 @@ fn process_bash(hook_input: HookInput) -> Result<()> {
     // enough and avoids a BERT dependency for analytics correctness.
     let input_tokens = ccr_core::tokens::count_tokens(&output_text);
     let output_tokens = ccr_core::tokens::count_tokens(&final_output);
-    let subcommand = full_cmd
+    let subcommand = effective_cmd
         .split_whitespace()
         .skip(1)
         .find(|s| !s.starts_with('-'))
