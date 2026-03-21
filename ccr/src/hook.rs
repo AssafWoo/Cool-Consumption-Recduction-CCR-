@@ -147,10 +147,18 @@ fn process_bash(hook_input: HookInput) -> Result<()> {
     let _ = crate::zoom_store::save_blocks(&sid, result.zoom_blocks);
 
     // ── Session-aware passes ──────────────────────────────────────────────────
+    // Skip BERT-based passes for short outputs: semantic compression and dedup
+    // add latency without meaningful benefit when there are few lines to work with.
+    const BERT_MIN_LINES: usize = 15;
+    let pipeline_line_count = result.output.lines().count();
 
-    let pipeline_emb = ccr_core::summarizer::embed_batch(&[result.output.as_str()])
-        .ok()
-        .and_then(|mut v| v.pop());
+    let pipeline_emb = if pipeline_line_count >= BERT_MIN_LINES {
+        ccr_core::summarizer::embed_batch(&[result.output.as_str()])
+            .ok()
+            .and_then(|mut v| v.pop())
+    } else {
+        None
+    };
 
     let output_after_delta = if let Some(ref emb) = pipeline_emb {
         let lines: Vec<&str> = result.output.lines().collect();
@@ -166,7 +174,7 @@ fn process_bash(hook_input: HookInput) -> Result<()> {
 
     let compression_factor = session.compression_factor();
     let centroid_for_c2 = session.command_centroid(&cmd_key).cloned();
-    let mut final_output = if compression_factor < 0.90 {
+    let mut final_output = if compression_factor < 0.90 && pipeline_line_count >= BERT_MIN_LINES {
         let line_count = after_dedup.lines().count();
         let reduced_budget = ((line_count as f32 * compression_factor) as usize).max(10);
         if let Some(ref centroid) = centroid_for_c2 {
@@ -179,25 +187,27 @@ fn process_bash(hook_input: HookInput) -> Result<()> {
         after_dedup
     };
 
-    if let Ok(mut embeddings) = ccr_core::summarizer::embed_batch(&[final_output.as_str()]) {
-        if let Some(emb) = embeddings.pop() {
-            let tokens = ccr_core::tokens::count_tokens(&final_output);
-            if let Ok(line_centroid) = ccr_core::summarizer::compute_output_centroid(&final_output) {
-                session.update_command_centroid(&cmd_key, line_centroid);
-            } else {
-                session.update_command_centroid(&cmd_key, emb.clone());
-            }
-            let is_state = {
-                if let Ok(cfg) = crate::config_loader::load_config() {
-                    cfg.global.state_commands.iter().any(|s| {
-                        command_hint.as_deref() == Some(s.as_str())
-                    })
+    if pipeline_line_count >= BERT_MIN_LINES {
+        if let Ok(mut embeddings) = ccr_core::summarizer::embed_batch(&[final_output.as_str()]) {
+            if let Some(emb) = embeddings.pop() {
+                let tokens = ccr_core::tokens::count_tokens(&final_output);
+                if let Ok(line_centroid) = ccr_core::summarizer::compute_output_centroid(&final_output) {
+                    session.update_command_centroid(&cmd_key, line_centroid);
                 } else {
-                    false
+                    session.update_command_centroid(&cmd_key, emb.clone());
                 }
-            };
-            session.record(&cmd_key, emb, tokens, &final_output, is_state);
-            session.save(&sid);
+                let is_state = {
+                    if let Ok(cfg) = crate::config_loader::load_config() {
+                        cfg.global.state_commands.iter().any(|s| {
+                            command_hint.as_deref() == Some(s.as_str())
+                        })
+                    } else {
+                        false
+                    }
+                };
+                session.record(&cmd_key, emb, tokens, &final_output, is_state);
+                session.save(&sid);
+            }
         }
     }
 
@@ -207,7 +217,8 @@ fn process_bash(hook_input: HookInput) -> Result<()> {
         );
     }
 
-    // Record analytics so `ccr gain` reflects hook-path savings.
+    // Record analytics: use pipeline output tokens (pre-BERT) for input — accurate
+    // enough and avoids a BERT dependency for analytics correctness.
     let input_tokens = ccr_core::tokens::count_tokens(&output_text);
     let output_tokens = ccr_core::tokens::count_tokens(&final_output);
     let subcommand = full_cmd
