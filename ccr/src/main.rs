@@ -8,6 +8,7 @@ mod intent;
 mod noise_learner;
 mod pre_cache;
 mod session;
+mod user_filters;
 mod util;
 mod zoom_store;
 

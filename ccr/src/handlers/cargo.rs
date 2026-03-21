@@ -31,6 +31,53 @@ impl Handler for CargoHandler {
     }
 }
 
+/// Group clippy warnings by lint rule name (e.g. `[unused_variables]`).
+/// Returns formatted lines: `[rule_name ×N]` plus up to 3 example location lines.
+/// Only applied when there are 3 or more warnings.
+fn group_clippy_warnings(warnings: &[String]) -> Vec<String> {
+    if warnings.len() < 3 {
+        return warnings.iter().map(|w| format!("  {}", w)).collect();
+    }
+
+    let rule_re = regex::Regex::new(r"\[(\w+)\]").unwrap();
+
+    // Collect (rule_name, original_warning_line) pairs; ungrouped warnings kept as-is.
+    let mut grouped: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut ungrouped: Vec<String> = Vec::new();
+
+    for w in warnings {
+        if let Some(cap) = rule_re.captures(w) {
+            let rule = cap[1].to_string();
+            grouped.entry(rule).or_default().push(w.clone());
+        } else {
+            ungrouped.push(w.clone());
+        }
+    }
+
+    let mut out: Vec<String> = Vec::new();
+
+    for (rule, lines) in &grouped {
+        out.push(format!("[{} \u{d7}{}]", rule, lines.len()));
+        for loc in lines.iter().take(3) {
+            // Extract location part: text after last `]` or the full line
+            let location = rule_re
+                .find(loc)
+                .map(|m| loc[m.end()..].trim())
+                .unwrap_or(loc.trim());
+            if !location.is_empty() {
+                out.push(format!("    {}", location));
+            }
+        }
+    }
+
+    for w in &ungrouped {
+        out.push(format!("  {}", w));
+    }
+
+    out
+}
+
 /// Filter `cargo build/check/clippy --message-format json` output.
 /// Keeps only compiler-message (errors + warnings); discards compiler-artifact noise.
 fn filter_build(output: &str) -> String {
@@ -55,10 +102,8 @@ fn filter_build(output: &str) -> String {
                             .and_then(|s| s.as_array())
                             .and_then(|s| s.first())
                             .map(|span| {
-                                let file = span
-                                    .get("file_name")
-                                    .and_then(|f| f.as_str())
-                                    .unwrap_or("");
+                                let file =
+                                    span.get("file_name").and_then(|f| f.as_str()).unwrap_or("");
                                 let line_n =
                                     span.get("line_start").and_then(|l| l.as_u64()).unwrap_or(0);
                                 format!(" [{}:{}]", file, line_n)
@@ -98,13 +143,8 @@ fn filter_build(output: &str) -> String {
     out.extend(errors.iter().cloned());
     if !warnings.is_empty() {
         out.push(format!("[{} warnings]", warnings.len()));
-        // Show first 3 warnings
-        for w in warnings.iter().take(3) {
-            out.push(format!("  {}", w));
-        }
-        if warnings.len() > 3 {
-            out.push(format!("  [+{} more warnings]", warnings.len() - 3));
-        }
+        let grouped = group_clippy_warnings(&warnings);
+        out.extend(grouped);
     }
     match success {
         Some(true) => {
@@ -139,7 +179,8 @@ fn filter_test(output: &str) -> String {
     for line in output.lines() {
         // Detect failure test lines: "test some::path ... FAILED"
         if line.trim_start().starts_with("test ") && line.ends_with("FAILED") {
-            let name = line.trim_start()
+            let name = line
+                .trim_start()
                 .trim_start_matches("test ")
                 .trim_end_matches(" ... FAILED")
                 .to_string();
@@ -197,4 +238,54 @@ fn filter_test(output: &str) -> String {
     }
 
     out.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── group_clippy_warnings ────────────────────────────────────────────────
+
+    #[test]
+    fn group_same_rule_five_warnings() {
+        let warnings: Vec<String> = (1..=5)
+            .map(|i| {
+                format!(
+                    "warning: unused variable [unused_variables] [src/main.rs:{}]",
+                    i
+                )
+            })
+            .collect();
+        let result = group_clippy_warnings(&warnings);
+        // First line should be the grouped header
+        assert!(result[0].contains("unused_variables") && result[0].contains("×5"));
+    }
+
+    #[test]
+    fn group_different_rules_grouped_separately() {
+        let warnings = vec![
+            "warning: unused variable `x` [unused_variables] [src/a.rs:1]".to_string(),
+            "warning: unused variable `y` [unused_variables] [src/a.rs:2]".to_string(),
+            "warning: function is never used: `foo` [dead_code] [src/b.rs:10]".to_string(),
+            "warning: function is never used: `bar` [dead_code] [src/b.rs:20]".to_string(),
+            "warning: function is never used: `baz` [dead_code] [src/b.rs:30]".to_string(),
+        ];
+        let result = group_clippy_warnings(&warnings);
+        let output = result.join("\n");
+        assert!(output.contains("dead_code") && output.contains("×3"));
+        assert!(output.contains("unused_variables") && output.contains("×2"));
+    }
+
+    #[test]
+    fn fewer_than_three_warnings_shown_as_is() {
+        let warnings = vec![
+            "warning: something [some_lint] [src/a.rs:1]".to_string(),
+            "warning: something else [other_lint] [src/b.rs:2]".to_string(),
+        ];
+        let result = group_clippy_warnings(&warnings);
+        // Should just be prefixed with "  " — no grouping header
+        assert_eq!(result.len(), 2);
+        assert!(result[0].starts_with("  "));
+        assert!(result[1].starts_with("  "));
+    }
 }

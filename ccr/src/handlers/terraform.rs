@@ -1,3 +1,4 @@
+use super::util;
 use super::Handler;
 
 pub struct TerraformHandler;
@@ -32,6 +33,15 @@ impl Handler for TerraformHandler {
 }
 
 fn filter_plan(output: &str) -> String {
+    const PLAN_NO_CHANGE_RULES: &[util::MatchOutputRule] = &[util::MatchOutputRule {
+        success_pattern: r"No changes\. Your infrastructure matches the configuration",
+        error_pattern: r"Error:",
+        ok_message: "no changes detected",
+    }];
+    if let Some(msg) = util::check_match_output(output, PLAN_NO_CHANGE_RULES) {
+        return msg;
+    }
+
     let mut out: Vec<String> = Vec::new();
     for line in output.lines() {
         let t = line.trim();
@@ -94,10 +104,23 @@ fn filter_init(output: &str) -> String {
 }
 
 fn filter_validate(output: &str) -> String {
+    const VALIDATE_OK_RULES: &[util::MatchOutputRule] = &[util::MatchOutputRule {
+        success_pattern: r"(?i)The configuration is valid|Success!",
+        error_pattern: r"(?i)error|Error",
+        ok_message: "terraform validate: ok",
+    }];
+    if let Some(msg) = util::check_match_output(output, VALIDATE_OK_RULES) {
+        return msg;
+    }
+
     let mut out: Vec<String> = Vec::new();
     for line in output.lines() {
         let t = line.trim();
-        if t.contains("Success") || t.contains("error") || t.contains("Error") || t.contains("warning") {
+        if t.contains("Success")
+            || t.contains("error")
+            || t.contains("Error")
+            || t.contains("warning")
+        {
             out.push(line.to_string());
         }
     }
@@ -105,5 +128,35 @@ fn filter_validate(output: &str) -> String {
         output.to_string()
     } else {
         out.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handler() -> TerraformHandler {
+        TerraformHandler
+    }
+
+    #[test]
+    fn plan_no_changes_short_circuits() {
+        let output = "Refreshing state...\nNo changes. Your infrastructure matches the configuration.\nTerraform has compared your real infrastructure against your configuration\nand found no differences, so no changes are needed.";
+        let result = handler().filter(output, &["terraform".to_string(), "plan".to_string()]);
+        assert_eq!(result, "no changes detected");
+    }
+
+    #[test]
+    fn plan_with_error_not_short_circuited() {
+        let output = "No changes. Your infrastructure matches the configuration.\nError: Invalid resource configuration";
+        let result = handler().filter(output, &["terraform".to_string(), "plan".to_string()]);
+        assert_ne!(result, "no changes detected");
+    }
+
+    #[test]
+    fn validate_ok_short_circuits() {
+        let output = "Success! The configuration is valid.\n";
+        let result = handler().filter(output, &["terraform".to_string(), "validate".to_string()]);
+        assert_eq!(result, "terraform validate: ok");
     }
 }

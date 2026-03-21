@@ -2,6 +2,20 @@ use super::Handler;
 
 pub struct LsHandler;
 
+const NOISE_DIRS: &[&str] = &[
+    "node_modules",
+    ".git",
+    "target",
+    "__pycache__",
+    ".next",
+    "dist",
+    "build",
+    ".cache",
+    ".venv",
+    "venv",
+    ".DS_Store",
+];
+
 impl Handler for LsHandler {
     fn filter(&self, output: &str, _args: &[String]) -> String {
         let lines: Vec<&str> = output
@@ -26,11 +40,17 @@ impl Handler for LsHandler {
                 })
                 .unwrap_or(false);
 
-        let entries: Vec<LsEntry> = if is_long_format {
+        let raw_entries: Vec<LsEntry> = if is_long_format {
             parse_long_format(&lines)
         } else {
             parse_short_format(&lines)
         };
+
+        // Filter out noise directories/files
+        let entries: Vec<LsEntry> = raw_entries
+            .into_iter()
+            .filter(|e| !NOISE_DIRS.contains(&e.name.as_str()))
+            .collect();
 
         // Sort: dirs first, then files
         let mut dirs: Vec<&LsEntry> = entries.iter().filter(|e| e.is_dir).collect();
@@ -65,8 +85,38 @@ impl Handler for LsHandler {
             files.len()
         ));
 
+        // Extension summary: top-3 extensions, only if >= 3 distinct
+        let ext_summary = build_ext_summary(&files);
+        if let Some(s) = ext_summary {
+            out.push(s);
+        }
+
         out.join("\n")
     }
+}
+
+fn build_ext_summary(files: &[&LsEntry]) -> Option<String> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for f in files {
+        if let Some(dot_pos) = f.name.rfind('.') {
+            let ext = &f.name[dot_pos..];
+            if !ext.is_empty() && ext.len() > 1 {
+                *counts.entry(ext.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    if counts.len() < 3 {
+        return None;
+    }
+    let mut sorted: Vec<(String, usize)> = counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let top3: Vec<String> = sorted
+        .iter()
+        .take(3)
+        .map(|(ext, count)| format!("{} \u{d7}{}", ext, count))
+        .collect();
+    Some(format!("top: {}", top3.join(", ")))
 }
 
 struct LsEntry {
@@ -101,4 +151,63 @@ fn parse_short_format(lines: &[&str]) -> Vec<LsEntry> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_filter(output: &str) -> String {
+        let handler = LsHandler;
+        handler.filter(output, &[])
+    }
+
+    #[test]
+    fn test_node_modules_filtered_out() {
+        let output = "src/\nnode_modules/\npackage.json\nREADME.md\n";
+        let result = run_filter(output);
+        assert!(!result.contains("node_modules"), "node_modules should be filtered, got: {}", result);
+        assert!(result.contains("src/"), "src/ should be present, got: {}", result);
+        assert!(result.contains("package.json"), "package.json should be present, got: {}", result);
+    }
+
+    #[test]
+    fn test_git_filtered_out() {
+        let output = ".git/\nsrc/\nmain.rs\n";
+        let result = run_filter(output);
+        assert!(!result.contains(".git"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_target_filtered_out() {
+        let output = "target/\nsrc/\nCargo.toml\n";
+        let result = run_filter(output);
+        assert!(!result.contains("target"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_extension_summary_shows_correct_counts() {
+        // 3 .rs, 2 .toml, 1 .md, 1 .txt → 4 distinct extensions → top 3 shown
+        let output = "a.rs\nb.rs\nc.rs\nCargo.toml\nWorkspace.toml\nREADME.md\nnotes.txt\n";
+        let result = run_filter(output);
+        assert!(result.contains("top:"), "should have extension summary, got: {}", result);
+        assert!(result.contains(".rs"), "got: {}", result);
+        assert!(result.contains(".toml"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_extension_summary_not_shown_when_less_than_3_distinct() {
+        let output = "a.rs\nb.rs\nc.toml\n";
+        let result = run_filter(output);
+        // Only 2 distinct extensions → no summary
+        assert!(!result.contains("top:"), "should not have extension summary, got: {}", result);
+    }
+
+    #[test]
+    fn test_short_listing_under_40_works() {
+        let output = "main.rs\nlib.rs\nCargo.toml\n";
+        let result = run_filter(output);
+        assert!(result.contains("main.rs"), "got: {}", result);
+        assert!(result.contains("[0 dirs, 3 files]"), "got: {}", result);
+    }
 }

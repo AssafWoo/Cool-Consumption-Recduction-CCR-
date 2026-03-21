@@ -2,6 +2,8 @@ pub mod aws;
 pub mod brew;
 pub mod cargo;
 pub mod clippy;
+pub mod json;
+pub mod log;
 pub mod curl;
 pub mod diff;
 pub mod docker;
@@ -56,6 +58,14 @@ pub trait Handler: Send + Sync {
 /// 2. Static alias / pattern table (covers versioned binaries, wrappers, common aliases)
 /// 3. BERT similarity routing for truly unknown commands
 pub fn get_handler(cmd: &str) -> Option<Box<dyn Handler>> {
+    // Level 0: user-defined TOML filters (.ccr/filters.toml or ~/.config/ccr/filters.toml)
+    let user_filters = crate::user_filters::load_user_filters();
+    if let Some(filter_def) = user_filters.commands.get(cmd) {
+        return Some(Box::new(crate::user_filters::UserFilterHandler {
+            filter_def: filter_def.clone(),
+        }));
+    }
+
     get_handler_exact(cmd)
         .or_else(|| get_handler_alias(cmd))
         .or_else(|| get_handler_bert(cmd))
@@ -102,6 +112,8 @@ fn get_handler_exact(cmd: &str) -> Option<Box<dyn Handler>> {
         "brew" => Some(Box::new(brew::BrewHandler)),
         "helm" => Some(Box::new(helm::HelmHandler)),
         "journalctl" => Some(Box::new(journalctl::JournalctlHandler)),
+        "json" => Some(Box::new(json::JsonHandler)),
+        "log" => Some(Box::new(log::LogHandler)),
         // Batch 6: New handlers
         "clippy" | "cargo-clippy" => Some(Box::new(clippy::ClippyHandler)),
         "next" | "next.js" => Some(Box::new(next::NextHandler)),
@@ -202,6 +214,8 @@ const HANDLER_REPS: &[(&str, &str)] = &[
     ("prettier format check write",     "prettier"),
     ("pnpm install add run exec",       "pnpm"),
     ("clippy warning lint rust",        "clippy"),
+    ("json parse schema object array",  "json"),
+    ("log output lines errors warnings","log"),
 ];
 
 const BERT_ROUTE_THRESHOLD: f32 = 0.55;

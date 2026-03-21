@@ -45,15 +45,21 @@ impl Handler for GrepHandler {
         let mut out: Vec<String> = Vec::new();
         let mut shown = 0;
         const LIMIT: usize = 50;
+        const PER_FILE_LIMIT: usize = 25;
 
         'outer: for (file, matches) in &by_file {
-            out.push(format!("{}:", file));
-            for m in matches {
+            out.push(format!("{}:", compact_path(&file)));
+            let file_shown = PER_FILE_LIMIT.min(matches.len());
+            let file_extra = matches.len().saturating_sub(PER_FILE_LIMIT);
+            for m in &matches[..file_shown] {
                 if shown >= LIMIT {
                     break 'outer;
                 }
                 out.push(format!("  {}", m));
                 shown += 1;
+            }
+            if file_extra > 0 {
+                out.push(format!("  [+{} more in this file]", file_extra));
             }
         }
 
@@ -67,6 +73,17 @@ impl Handler for GrepHandler {
 
         out.join("\n")
     }
+}
+
+fn compact_path(path: &str) -> String {
+    if path.len() <= 50 {
+        return path.to_string();
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() <= 2 {
+        return path.to_string();
+    }
+    format!("{}/.../{}", parts[0], parts[parts.len() - 1])
 }
 
 /// Attempt to split "file:linenum:content" or "file:content"
@@ -97,5 +114,76 @@ fn truncate_line(line: &str, max: usize) -> String {
         line.to_string()
     } else {
         format!("{}…", chars[..max - 1].iter().collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compact_path_short_unchanged() {
+        let path = "src/main.rs";
+        assert_eq!(compact_path(path), path);
+    }
+
+    #[test]
+    fn test_compact_path_long_compacted() {
+        let path = "very/long/deeply/nested/directory/structure/that/exceeds/fifty/characters/file.rs";
+        let result = compact_path(path);
+        assert!(result.len() <= path.len(), "should be shorter, got: {}", result);
+        assert!(result.contains("very/"), "should start with first segment, got: {}", result);
+        assert!(result.contains("file.rs"), "should end with last segment, got: {}", result);
+        assert!(result.contains("..."), "should contain ellipsis, got: {}", result);
+    }
+
+    #[test]
+    fn test_compact_path_exactly_50_unchanged() {
+        // 50 chars exactly
+        let path = "a".repeat(25) + "/" + &"b".repeat(24);
+        assert_eq!(path.len(), 50);
+        assert_eq!(compact_path(&path), path);
+    }
+
+    #[test]
+    fn test_per_file_limit_of_25() {
+        let handler = GrepHandler;
+        // Build output with 30 matches in one file
+        let lines: Vec<String> = (0..30)
+            .map(|i| format!("src/main.rs:{}:match here", i + 1))
+            .collect();
+        let output = lines.join("\n");
+        let result = handler.filter(&output, &[]);
+        assert!(
+            result.contains("[+5 more in this file]"),
+            "expected per-file overflow message, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_per_file_limit_not_triggered_for_small_file() {
+        let handler = GrepHandler;
+        let lines: Vec<String> = (0..10)
+            .map(|i| format!("src/lib.rs:{}:some match", i + 1))
+            .collect();
+        let output = lines.join("\n");
+        let result = handler.filter(&output, &[]);
+        assert!(
+            !result.contains("more in this file"),
+            "should not have overflow message, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_long_path_in_output_compacted() {
+        let handler = GrepHandler;
+        let long_path =
+            "very/long/deeply/nested/directory/structure/that/exceeds/fifty/characters/file.rs";
+        let output = format!("{}:1:fn main()", long_path);
+        let result = handler.filter(&output, &[]);
+        // The file header line should have the compacted path
+        assert!(result.contains(".../file.rs:"), "expected compacted path in output, got: {}", result);
     }
 }
